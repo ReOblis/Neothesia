@@ -1,3 +1,13 @@
 [23:50:55] [INFO] Connecting to Neothesia TCP Server on 127.0.0.1:48888...
 [23:50:55] [INFO] [OK] Connected to Neothesia core TCP socket.
 [23:50:55] [INFO] Scanning / Connecting to Piano Bluetooth [A8:76:B4:9C:A4:C6]...
+[23:51:00] [INFO] [OK] Bluetooth connected to Piano (A8:76:B4:9C:A4:C6)!
+[23:51:00] [INFO] [OK] BLE Notification active. Forwarding Piano -> Neothesia.
+[23:55:11] [ERROR] BLE write error: [WinError -2147467260] Operation aborted
+[23:55:11] [INFO] Scanning / Connecting to Piano Bluetooth [A8:76:B4:9C:A4:C6]...
+[23:55:13] [INFO] [OK] Bluetooth connected to Piano (A8:76:B4:9C:A4:C6)!
+[23:55:13] [INFO] [OK] BLE Notification active. Forwarding Piano -> Neothesia.
+[23:55:20] [ERROR] BLE write error: [WinError -2147467260] Operation aborted
+[23:55:20] [INFO] Scanning / Connecting to Piano Bluetooth [A8:76:B4:9C:A4:C6]...
+[23:55:23] [INFO] [OK] Bluetooth connected to Piano (A8:76:B4:9C:A4:C6)!
+[23:55:23] [INFO] [OK] BLE Notification active. Forwarding Piano -> Neothesia.
