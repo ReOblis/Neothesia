@@ -7,6 +7,7 @@ mod output_manager;
 mod scene;
 mod song;
 mod utils;
+pub mod bt_bridge;
 
 use std::{sync::Arc, time::Duration};
 

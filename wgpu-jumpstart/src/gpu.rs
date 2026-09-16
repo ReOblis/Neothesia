@@ -56,6 +56,9 @@ impl Gpu {
 
         let mut state_machine = FallbackStateMachine::DefaultOrEnv;
         let mut desc = wgpu::InstanceDescriptor::new_with_display_handle_from_env(display());
+        if cfg!(target_os = "windows") {
+            desc.backends = wgpu::Backends::from_env().unwrap_or(wgpu::Backends::DX12);
+        }
 
         let (gpu, surface) = loop {
             let res = Self::try_init(

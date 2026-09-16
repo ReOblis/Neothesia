@@ -13,9 +13,11 @@ use std::{
 };
 
 use midi_file::midly::{MidiMessage, num::u4};
+use crate::bt_bridge::BtBridgeHandle;
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum OutputDescriptor {
+    Bluetooth(BtBridgeHandle),
     #[cfg(feature = "synth")]
     Synth(Option<PathBuf>),
     MidiOut(MidiPortInfo),
@@ -38,11 +40,16 @@ impl OutputDescriptor {
     pub fn is_synth(&self) -> bool {
         matches!(self, OutputDescriptor::Synth(_))
     }
+
+    pub fn is_bt(&self) -> bool {
+        matches!(self, OutputDescriptor::Bluetooth(_))
+    }
 }
 
 impl Display for OutputDescriptor {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
+            OutputDescriptor::Bluetooth(_) => write!(f, "Piano LED 88 (Bluetooth)"),
             #[cfg(feature = "synth")]
             OutputDescriptor::Synth(_) => write!(f, "Buildin Synth"),
             OutputDescriptor::MidiOut(info) => write!(f, "{info}"),
@@ -53,6 +60,7 @@ impl Display for OutputDescriptor {
 
 #[derive(Clone)]
 pub enum OutputConnection {
+    Bluetooth(BtBridgeHandle),
     Midi(midi_backend::MidiOutputConnection),
     #[cfg(feature = "synth")]
     Synth(synth_backend::SynthOutputConnection),
@@ -62,6 +70,7 @@ pub enum OutputConnection {
 impl OutputConnection {
     pub fn midi_event(&self, channel: u4, msg: MidiMessage) {
         match self {
+            OutputConnection::Bluetooth(bt) => bt.send_midi(channel, msg),
             OutputConnection::Midi(b) => b.midi_event(channel, msg),
             #[cfg(feature = "synth")]
             OutputConnection::Synth(b) => b.midi_event(channel, msg),
@@ -77,6 +86,7 @@ impl OutputConnection {
     }
     pub fn stop_all(&self) {
         match self {
+            OutputConnection::Bluetooth(bt) => bt.stop_all(),
             OutputConnection::Midi(b) => b.stop_all(),
             #[cfg(feature = "synth")]
             OutputConnection::Synth(b) => b.stop_all(),
@@ -86,6 +96,7 @@ impl OutputConnection {
 }
 
 pub struct OutputManager {
+    bt_handle: Option<BtBridgeHandle>,
     #[cfg(feature = "synth")]
     synth_backend: Option<SynthBackend>,
     midi_backend: Option<MidiBackend>,
@@ -93,14 +104,8 @@ pub struct OutputManager {
     output_connection: (OutputDescriptor, OutputConnection),
 }
 
-impl Default for OutputManager {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl OutputManager {
-    pub fn new() -> Self {
+    pub fn new(bt_handle: Option<BtBridgeHandle>) -> Self {
         #[cfg(feature = "synth")]
         let synth_backend = match SynthBackend::new() {
             Ok(synth_backend) => Some(synth_backend),
@@ -118,17 +123,31 @@ impl OutputManager {
             }
         };
 
+        let initial_output = if let Some(ref bt) = bt_handle {
+            (
+                OutputDescriptor::Bluetooth(bt.clone()),
+                OutputConnection::Bluetooth(bt.clone()),
+            )
+        } else {
+            (OutputDescriptor::DummyOutput, OutputConnection::DummyOutput)
+        };
+
         Self {
+            bt_handle,
             #[cfg(feature = "synth")]
             synth_backend,
             midi_backend,
 
-            output_connection: (OutputDescriptor::DummyOutput, OutputConnection::DummyOutput),
+            output_connection: initial_output,
         }
     }
 
     pub fn outputs(&self) -> Vec<OutputDescriptor> {
         let mut outs = Vec::new();
+
+        if let Some(ref bt) = self.bt_handle {
+            outs.push(OutputDescriptor::Bluetooth(bt.clone()));
+        }
 
         #[cfg(feature = "synth")]
         if let Some(synth) = &self.synth_backend {
@@ -145,7 +164,10 @@ impl OutputManager {
 
     pub fn connect(&mut self, desc: OutputDescriptor) {
         if desc != self.output_connection.0 {
-            match desc {
+            match desc.clone() {
+                OutputDescriptor::Bluetooth(bt) => {
+                    self.output_connection = (desc, OutputConnection::Bluetooth(bt));
+                }
                 #[cfg(feature = "synth")]
                 OutputDescriptor::Synth(ref font) => {
                     if let Some(ref mut synth) = self.synth_backend {

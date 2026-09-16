@@ -286,12 +286,13 @@ impl TopBar {
                     let w = ctx.window_state.logical_size.width;
 
                     let p = x / w;
-                    this.player.set_percentage_time(p);
+                    this.player.set_percentage_time_silent(p);
                     this.keyboard.reset_notes();
                 }
             }
             nuon::ClickAreaEvent::PressEnd { .. } => {
                 this.rewind_controller.stop_rewind(&mut this.player);
+                this.keyboard.reset_notes();
             }
             nuon::ClickAreaEvent::Idle { .. } => {}
         }
@@ -340,13 +341,13 @@ impl TopBar {
 
         let (loop_start_ev, loop_end_ev) = if looper_active {
             let loop_start_ev = nuon::click_area("LooperStart")
-                .x(loop_start)
-                .width(5.0)
+                .x(loop_start - 10.0)
+                .width(20.0)
                 .height(loop_h)
                 .build(ui);
             let loop_end_ev = nuon::click_area("LooperEnd")
-                .x(loop_end)
-                .width(5.0)
+                .x(loop_end - 10.0)
+                .width(20.0)
                 .height(loop_h)
                 .build(ui);
             (loop_start_ev, loop_end_ev)

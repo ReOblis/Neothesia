@@ -1,8 +1,8 @@
-use std::sync::Arc;
+﻿use std::sync::Arc;
 
 use crate::{
     NeothesiaEvent, TransformUniform, config::Config, input_manager::InputManager,
-    output_manager::OutputManager, utils::window::WindowState,
+    output_manager::OutputManager, bt_bridge::BtBridgeService, utils::window::WindowState,
 };
 use neothesia_core::render::{QuadRendererFactory, TextRendererFactory};
 use wgpu_jumpstart::{Gpu, Uniform};
@@ -20,6 +20,7 @@ pub struct Context {
     pub text_renderer_factory: TextRendererFactory,
     pub quad_renderer_factory: QuadRendererFactory,
 
+    pub _bt_service: BtBridgeService,
     pub output_manager: OutputManager,
     pub input_manager: InputManager,
     pub config: Config,
@@ -57,6 +58,8 @@ impl Context {
         let text_renderer_factory = TextRendererFactory::new(&gpu);
         let quad_renderer_factory = QuadRendererFactory::new(&gpu, &transform_uniform);
 
+        let (bt_service, bt_handle) = BtBridgeService::start(proxy.clone());
+
         Self {
             window,
 
@@ -66,8 +69,9 @@ impl Context {
             text_renderer_factory,
             quad_renderer_factory,
 
-            output_manager: Default::default(),
+            output_manager: OutputManager::new(Some(bt_handle)),
             input_manager: InputManager::new(proxy.clone()),
+            _bt_service: bt_service,
             config,
             proxy,
             frame_timestamp: std::time::Instant::now(),

@@ -1,4 +1,4 @@
-use midi_file::midly::{MidiMessage, num::u4};
+use midi_file::midly::{num::u4, MidiMessage};
 
 use crate::{
     output_manager::OutputConnection,
@@ -6,9 +6,14 @@ use crate::{
 };
 use neothesia_core::piano_layout;
 use std::{
-    collections::{HashMap, HashSet},
-    time::{Duration, Instant},
+    collections::HashSet,
+    time::Duration,
 };
+
+pub fn is_black_key(midi_note: u8) -> bool {
+    let pitch = midi_note % 12;
+    pitch == 1 || pitch == 3 || pitch == 6 || pitch == 8 || pitch == 10
+}
 
 pub struct MidiPlayer {
     playback: midi_file::PlaybackState,
@@ -79,19 +84,26 @@ impl MidiPlayer {
             };
             match config.player {
                 PlayerConfig::Auto => {
-                    self.output // TODO: Send to multiple outputs
+                    self.output
                         .midi_event(u4::new(channel), event.message);
                 }
                 PlayerConfig::Human => {
                     self.play_along
                         .midi_event(MidiEventSource::File, &event.message);
 
-                    // In Human mode note events from the file are targets for the player,
-                    // not notes to be played by the synthesizer. Keep forwarding controller
-                    // and other non-note events so the track still sounds as intended.
-                    if should_forward_human_event(&event.message) {
-                        self.output.midi_event(u4::new(channel), event.message);
-                    }
+                    // For Human PlayAlong, customize velocity for visual distinction on piano LED
+                    let msg = match event.message {
+                        midi_file::midly::MidiMessage::NoteOn { key, vel } if vel.as_int() > 0 => {
+                            let key_num = key.as_int();
+                            let custom_vel = if is_black_key(key_num) { 120 } else { 80 };
+                            midi_file::midly::MidiMessage::NoteOn {
+                                key,
+                                vel: custom_vel.into(),
+                            }
+                        }
+                        other => other,
+                    };
+                    self.output.midi_event(u4::new(channel), msg);
                 }
                 PlayerConfig::Mute => {}
             }
@@ -100,8 +112,9 @@ impl MidiPlayer {
         events
     }
 
-    fn clear(&mut self) {
+    pub fn clear(&mut self) {
         self.output.stop_all();
+        self.play_along.clear();
     }
 }
 
@@ -141,18 +154,105 @@ impl MidiPlayer {
         }
     }
 
-    pub fn set_time(&mut self, time: Duration) {
-        self.playback.set_time(time);
-
-        // Discard all of the events till that point
-        let events = self.playback.update(Duration::ZERO);
-        std::mem::drop(events);
-
+    pub fn sync_state_at_current_time(&mut self) {
         self.clear();
+        self.play_along.clear();
+        let time = self.playback.time();
         self.send_midi_programs_for_timestamp(&time);
+
+        let leed_in = *self.playback.leed_in();
+        let song_time = if time >= leed_in {
+            time - leed_in
+        } else {
+            Duration::ZERO
+        };
+
+        // 1. Collect notes active at song_time OR find the earliest upcoming chord
+        let mut active_or_next_notes = Vec::new();
+        let mut min_upcoming_start: Option<Duration> = None;
+
+        for track in self.song.file.tracks.iter() {
+            let config = &self.song.config.tracks[track.track_id];
+            if config.player == PlayerConfig::Mute {
+                continue;
+            }
+
+            for note in track.notes.iter() {
+                if note.start <= song_time && song_time < (note.start + note.duration) {
+                    active_or_next_notes.push((track.track_id, note.clone()));
+                } else if note.start >= song_time {
+                    match min_upcoming_start {
+                        None => min_upcoming_start = Some(note.start),
+                        Some(min_t) => {
+                            if note.start < min_t {
+                                min_upcoming_start = Some(note.start);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // If no active note is playing right now, snap to the nearest upcoming notes
+        if active_or_next_notes.is_empty() {
+            if let Some(next_start) = min_upcoming_start {
+                self.set_time_silent(next_start + leed_in);
+
+                for track in self.song.file.tracks.iter() {
+                    let config = &self.song.config.tracks[track.track_id];
+                    if config.player == PlayerConfig::Mute {
+                        continue;
+                    }
+
+                    for note in track.notes.iter() {
+                        if note.start >= next_start && note.start <= next_start + Duration::from_millis(40) {
+                            active_or_next_notes.push((track.track_id, note.clone()));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Light up LEDs on piano and register required notes
+        for (track_id, note) in active_or_next_notes {
+            let config = &self.song.config.tracks[track_id];
+            let channel = if self.separate_channels {
+                note.track_color_id as u8
+            } else {
+                note.channel
+            };
+
+            let custom_vel = if is_black_key(note.note) { 120 } else { 80 };
+
+            let msg = midi_file::midly::MidiMessage::NoteOn {
+                key: note.note.into(),
+                vel: custom_vel.into(),
+            };
+
+            match config.player {
+                PlayerConfig::Auto => {
+                    self.output.midi_event(u4::new(channel), msg);
+                }
+                PlayerConfig::Human => {
+                    self.play_along.midi_event(MidiEventSource::File, &msg);
+                    self.output.midi_event(u4::new(channel), msg);
+                }
+                PlayerConfig::Mute => {}
+            }
+        }
     }
 
-    pub fn rewind(&mut self, delta: i64) {
+    pub fn set_time_silent(&mut self, time: Duration) {
+        self.playback.set_time(time);
+        let events = self.playback.update(Duration::ZERO);
+        std::mem::drop(events);
+    }
+
+    pub fn set_percentage_time_silent(&mut self, p: f32) {
+        self.set_time_silent(self.percentage_to_time(p));
+    }
+
+    pub fn rewind_silent(&mut self, delta: i64) {
         let mut time = self.playback.time();
 
         if delta < 0 {
@@ -163,7 +263,17 @@ impl MidiPlayer {
             time = time.saturating_add(delta);
         }
 
-        self.set_time(time);
+        self.set_time_silent(time);
+    }
+
+    pub fn set_time(&mut self, time: Duration) {
+        self.set_time_silent(time);
+        self.sync_state_at_current_time();
+    }
+
+    pub fn rewind(&mut self, delta: i64) {
+        self.rewind_silent(delta);
+        self.sync_state_at_current_time();
     }
 
     pub fn percentage_to_time(&self, p: f32) -> Duration {
@@ -212,9 +322,54 @@ impl MidiPlayer {
         &self.play_along
     }
 
-    pub fn user_midi_event(&mut self, channel: u8, message: &MidiMessage) {
-        self.output.midi_event(u4::new(channel), *message);
-        self.play_along.midi_event(MidiEventSource::User, message);
+    pub fn user_midi_event(&mut self, _channel: u8, message: &MidiMessage) {
+        match message {
+            MidiMessage::NoteOn { key, vel } => {
+                let note_id = key.as_int();
+                if vel.as_int() > 0 {
+                    self.play_along.midi_event(MidiEventSource::User, message);
+                    // When user hits a required note, extinguish its LED guide on the piano
+                    if self.play_along.required_notes().contains(&note_id) {
+                        self.output.midi_event(
+                            u4::new(0),
+                            midi_file::midly::MidiMessage::NoteOff {
+                                key: *key,
+                                vel: 0.into(),
+                            },
+                        );
+                    }
+                } else {
+                    self.play_along.midi_event(MidiEventSource::User, message);
+                    // If user releases a key while chord is not fully complete, re-light it
+                    if self.play_along.required_notes().contains(&note_id) {
+                        let custom_vel = if is_black_key(note_id) { 120 } else { 80 };
+                        self.output.midi_event(
+                            u4::new(0),
+                            midi_file::midly::MidiMessage::NoteOn {
+                                key: *key,
+                                vel: custom_vel.into(),
+                            },
+                        );
+                    }
+                }
+            }
+            MidiMessage::NoteOff { key, .. } => {
+                let note_id = key.as_int();
+                self.play_along.midi_event(MidiEventSource::User, message);
+                // If user releases a key while chord is not fully complete, re-light it
+                if self.play_along.required_notes().contains(&note_id) {
+                    let custom_vel = if is_black_key(note_id) { 120 } else { 80 };
+                    self.output.midi_event(
+                        u4::new(0),
+                        midi_file::midly::MidiMessage::NoteOn {
+                            key: *key,
+                            vel: custom_vel.into(),
+                        },
+                    );
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -223,70 +378,20 @@ pub enum MidiEventSource {
     User,
 }
 
-fn should_forward_human_event(message: &MidiMessage) -> bool {
-    !matches!(
-        message,
-        MidiMessage::NoteOn { .. } | MidiMessage::NoteOff { .. }
-    )
-}
-
 type NoteId = u8;
 
 #[derive(Debug, Default)]
 struct PlayerStats {
-    /// User notes that expired, or were simply wrong
     wrong_notes: usize,
-    /// List of deltas of notes played early
     played_early: Vec<Duration>,
-    /// List of deltas of notes played late
     played_late: Vec<Duration>,
-}
-
-impl PlayerStats {
-    #[allow(unused)]
-    fn timing_acurracy(&self) -> f64 {
-        let all = self.played_early.len() + self.played_late.len();
-        let early_count = self.count_too_early();
-        let late_count = self.count_too_late();
-        (early_count + late_count) as f64 / all as f64
-    }
-
-    fn count_too_early(&self) -> usize {
-        // 500 is the same as expire time, so this does not make much sense, but we can chooses
-        // better threshold later down the line
-        Self::count_with_threshold(&self.played_early, Duration::from_millis(500))
-    }
-
-    fn count_too_late(&self) -> usize {
-        // 160 to forgive touching the bottom
-        Self::count_with_threshold(&self.played_late, Duration::from_millis(160))
-    }
-
-    fn count_with_threshold(events: &[Duration], threshold: Duration) -> usize {
-        events
-            .iter()
-            .filter(|delta| **delta > threshold)
-            .fold(0, |n, _| n + 1)
-    }
-}
-
-#[derive(Debug)]
-struct NotePress {
-    timestamp: Instant,
 }
 
 #[derive(Debug)]
 pub struct PlayAlong {
     user_keyboard_range: piano_layout::KeyboardRange,
-
-    /// Notes required to proggres further in the song
-    required_notes: HashMap<NoteId, NotePress>,
-    /// List of user key press events that happened in last 500ms,
-    /// used for play along leeway logic
-    user_pressed_recently: HashMap<NoteId, NotePress>,
-    /// File notes that had NoteOn event, but no NoteOff yet
-    in_proggres_file_notes: HashSet<NoteId>,
-
+    required_notes: HashSet<NoteId>,
+    user_held_keys: HashSet<NoteId>,
     stats: PlayerStats,
 }
 
@@ -295,72 +400,30 @@ impl PlayAlong {
         Self {
             user_keyboard_range,
             required_notes: Default::default(),
-            user_pressed_recently: Default::default(),
-            in_proggres_file_notes: Default::default(),
+            user_held_keys: Default::default(),
             stats: PlayerStats::default(),
         }
     }
 
-    fn update(&mut self) {
-        // Instead of calling .elapsed() per item let's fetch `now` once, and subtract it ourselves
-        let now = Instant::now();
-        let threshold = Duration::from_millis(500);
+    fn update(&mut self) {}
 
-        // Track the count of items before retain
-        let count_before = self.user_pressed_recently.len();
-
-        // Retain only the items that are within the threshold
-        self.user_pressed_recently
-            .retain(|_, item| now.duration_since(item.timestamp) <= threshold);
-
-        self.stats.wrong_notes += count_before - self.user_pressed_recently.len();
+    pub fn required_notes(&self) -> &HashSet<NoteId> {
+        &self.required_notes
     }
 
     fn user_press_key(&mut self, note_id: u8, active: bool) {
-        let timestamp = Instant::now();
-
         if active {
-            // Check if note has already been played by a file
-            if let Some(required_press) = self.required_notes.remove(&note_id) {
-                self.stats
-                    .played_late
-                    .push(timestamp.duration_since(required_press.timestamp));
-            } else {
-                // This note was not played by file yet, place it in recents
-                let got_replaced = self
-                    .user_pressed_recently
-                    .insert(note_id, NotePress { timestamp })
-                    .is_some();
-
-                if got_replaced {
-                    self.stats.wrong_notes += 1
-                }
-            }
+            self.user_held_keys.insert(note_id);
+        } else {
+            self.user_held_keys.remove(&note_id);
         }
     }
 
     fn file_press_key(&mut self, note_id: u8, active: bool) {
-        let timestamp = Instant::now();
         if active {
-            // Check if note got pressed earlier 500ms (user_pressed_recently)
-            if let Some(press) = self.user_pressed_recently.remove(&note_id) {
-                self.stats
-                    .played_early
-                    .push(timestamp.duration_since(press.timestamp));
-            } else {
-                // Player never pressed that note, let it reach required_notes
-
-                // Ignore overlapping notes
-                if self.in_proggres_file_notes.contains(&note_id) {
-                    return;
-                }
-
-                self.required_notes.insert(note_id, NotePress { timestamp });
-            }
-
-            self.in_proggres_file_notes.insert(note_id);
+            self.required_notes.insert(note_id);
         } else {
-            self.in_proggres_file_notes.remove(&note_id);
+            self.required_notes.remove(&note_id);
         }
     }
 
@@ -377,19 +440,27 @@ impl PlayAlong {
 
     pub fn midi_event(&mut self, source: MidiEventSource, message: &MidiMessage) {
         match message {
-            MidiMessage::NoteOn { key, .. } => self.press_key(source, key.as_int(), true),
-            MidiMessage::NoteOff { key, .. } => self.press_key(source, key.as_int(), false),
+            MidiMessage::NoteOn { key, vel } => {
+                let active = vel.as_int() > 0;
+                self.press_key(source, key.as_int(), active);
+            }
+            MidiMessage::NoteOff { key, .. } => {
+                self.press_key(source, key.as_int(), false);
+            }
             _ => {}
         }
     }
 
     pub fn clear(&mut self) {
         self.required_notes.clear();
-        self.user_pressed_recently.clear();
-        self.in_proggres_file_notes.clear();
+        self.user_held_keys.clear();
     }
 
     pub fn are_required_keys_pressed(&self) -> bool {
-        self.required_notes.is_empty()
+        if self.required_notes.is_empty() {
+            return true;
+        }
+        // All currently required notes (e.g. chord) must be held simultaneously
+        self.required_notes.iter().all(|note| self.user_held_keys.contains(note))
     }
 }

@@ -43,6 +43,7 @@ impl RewindController {
 
     fn start_rewind(&mut self, player: &mut MidiPlayer, controller: RewindController) {
         player.pause();
+        player.clear();
         *self = controller;
     }
 
@@ -55,6 +56,7 @@ impl RewindController {
             RewindController::None => None,
         };
 
+        player.sync_state_at_current_time();
         if was_paused == Some(false) {
             player.resume();
         }
@@ -71,7 +73,7 @@ impl RewindController {
                 *speed
             };
 
-            player.rewind((100.0 * v as f32 * delta.as_secs_f32()).round() as i64);
+            player.rewind_silent((100.0 * v as f32 * delta.as_secs_f32()).round() as i64);
         }
     }
 
@@ -128,7 +130,7 @@ impl RewindController {
             let w = &window_state.logical_size.width;
 
             let p = x / w;
-            player.set_percentage_time(p);
+            player.set_percentage_time_silent(p);
         }
     }
 }
