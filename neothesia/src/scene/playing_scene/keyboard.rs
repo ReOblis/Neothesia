@@ -128,7 +128,7 @@ impl Keyboard {
         }
     }
 
-    pub fn file_midi_events(&mut self, config: &Config, events: &[&midi_file::MidiEvent]) {
+    pub fn file_midi_events(&mut self, config: &Config, events: &[midi_file::MidiEvent]) {
         let range_start = self.range().start() as usize;
 
         for e in events {

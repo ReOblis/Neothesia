@@ -21,6 +21,11 @@ pub struct MidiPlayer {
     song: Song,
     play_along: PlayAlong,
     separate_channels: bool,
+    /// `note.start` của mọi nốt thuộc track Human, sắp xếp tăng dần. Cache 1 lần lúc khởi
+    /// tạo (track player config chỉ chỉnh được ở menu, không đổi khi đang chơi) để
+    /// `pull_in_chord_siblings` tra cứu bằng binary search thay vì quét lại toàn bộ bài
+    /// mỗi lần có NoteOn — quét toàn bộ mỗi frame từng gây giật hình ở PlayAlong.
+    human_note_starts: Vec<Duration>,
 }
 
 impl MidiPlayer {
@@ -46,12 +51,23 @@ impl MidiPlayer {
         separate_channels: bool,
         lead_in: Duration,
     ) -> Self {
+        let mut human_note_starts: Vec<Duration> = song
+            .file
+            .tracks
+            .iter()
+            .filter(|track| song.config.tracks[track.track_id].player == PlayerConfig::Human)
+            .flat_map(|track| track.notes.iter())
+            .map(|note| note.start)
+            .collect();
+        human_note_starts.sort_unstable();
+
         let mut player = Self {
             playback: midi_file::PlaybackState::new(lead_in, song.file.tracks.clone()),
             output,
             play_along: PlayAlong::new(user_keyboard_range),
             song,
             separate_channels,
+            human_note_starts,
         };
         // Let's reset programs,
         // for timestamp 0 most likely all programs will be 0, so this should clean any leftovers
@@ -69,10 +85,13 @@ impl MidiPlayer {
     /// When playing: returns midi events
     ///
     /// When paused: returns None
-    pub fn update(&mut self, delta: Duration) -> Vec<&midi_file::MidiEvent> {
+    pub fn update(&mut self, delta: Duration) -> Vec<midi_file::MidiEvent> {
         self.play_along.update();
 
-        let events = self.playback.update(delta);
+        let mut events: Vec<midi_file::MidiEvent> =
+            self.playback.update(delta).into_iter().cloned().collect();
+
+        self.pull_in_chord_siblings(&mut events);
 
         events.iter().for_each(|event| {
             let config = &self.song.config.tracks[event.track_id];
@@ -115,6 +134,63 @@ impl MidiPlayer {
     pub fn clear(&mut self) {
         self.output.stop_all();
         self.play_along.clear();
+    }
+
+    /// Humanized MIDI files often have chord notes that start a few ms apart
+    /// instead of at the exact same timestamp. The Wait-For-Me gate in
+    /// `PlayingScene::update_midi_player` freezes the timeline as soon as the
+    /// *first* dispatched note of such a chord becomes required, so any
+    /// sibling note that hasn't reached its own timestamp yet never gets a
+    /// chance to join `required_notes` — the player can get stuck holding
+    /// the first note forever while waiting on a note that will never arrive.
+    ///
+    /// To fix this, once we've just dispatched a Human NoteOn, look ahead a
+    /// fixed CHORD_CLUSTER_WINDOW from that note's timestamp and eagerly pull
+    /// in (dispatch) any sibling notes inside that window, so the whole
+    /// chord becomes required — and lit up — together.
+    fn pull_in_chord_siblings(&mut self, events: &mut Vec<midi_file::MidiEvent>) {
+        const CHORD_CLUSTER_WINDOW: Duration = Duration::from_millis(50);
+
+        let anchor_start = events
+            .iter()
+            .filter(|event| {
+                matches!(event.message, MidiMessage::NoteOn { vel, .. } if vel.as_int() > 0)
+                    && self.song.config.tracks[event.track_id].player == PlayerConfig::Human
+            })
+            .map(|event| event.timestamp)
+            .min();
+
+        let Some(anchor_start) = anchor_start else {
+            return;
+        };
+        let deadline = anchor_start + CHORD_CLUSTER_WINDOW;
+
+        loop {
+            let leed_in = *self.playback.leed_in();
+            let running = self.playback.time();
+
+            // Binary search trên danh sách đã sort/cache sẵn (self.human_note_starts) thay
+            // vì quét lại toàn bộ track mỗi lần — bài nhạc nhiều nốt + hàm này chạy gần như
+            // mỗi frame khi đang PlayAlong sẽ gây giật hình nếu quét O(N) mỗi lần.
+            let search_from = running.saturating_sub(leed_in);
+            let idx = self.human_note_starts.partition_point(|&start| start <= search_from);
+            let next_pending_start = self
+                .human_note_starts
+                .get(idx)
+                .copied()
+                .filter(|&start| start <= deadline);
+
+            let Some(next_start) = next_pending_start else {
+                break;
+            };
+
+            let extra_delta = (next_start + leed_in).saturating_sub(running);
+            let new_events = self.playback.update(extra_delta);
+            if new_events.is_empty() {
+                break;
+            }
+            events.extend(new_events.into_iter().cloned());
+        }
     }
 }
 
