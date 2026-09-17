@@ -26,6 +26,7 @@ pub struct MidiPlayer {
     /// `pull_in_chord_siblings` tra cứu bằng binary search thay vì quét lại toàn bộ bài
     /// mỗi lần có NoteOn — quét toàn bộ mỗi frame từng gây giật hình ở PlayAlong.
     human_note_starts: Vec<Duration>,
+    human_note_targets: Vec<Duration>,
 }
 
 impl MidiPlayer {
@@ -61,6 +62,11 @@ impl MidiPlayer {
             .collect();
         human_note_starts.sort_unstable();
 
+        let human_note_targets: Vec<Duration> = human_note_starts
+            .iter()
+            .map(|&start| start + lead_in)
+            .collect();
+
         let mut player = Self {
             playback: midi_file::PlaybackState::new(lead_in, song.file.tracks.clone()),
             output,
@@ -68,6 +74,7 @@ impl MidiPlayer {
             song,
             separate_channels,
             human_note_starts,
+            human_note_targets,
         };
         // Let's reset programs,
         // for timestamp 0 most likely all programs will be 0, so this should clean any leftovers
@@ -85,8 +92,22 @@ impl MidiPlayer {
     /// When playing: returns midi events
     ///
     /// When paused: returns None
-    pub fn update(&mut self, delta: Duration) -> Vec<midi_file::MidiEvent> {
+    pub fn update(&mut self, mut delta: Duration) -> Vec<midi_file::MidiEvent> {
         self.play_along.update();
+
+        // Clamp delta so playback stops EXACTLY at the next Human note target,
+        // preventing frames from leaping over fast / repeated notes.
+        let running = self.playback.time();
+
+        let idx = self.human_note_targets.partition_point(|&target| target <= running);
+        if let Some(&next_target) = self.human_note_targets.get(idx) {
+            if next_target > running {
+                let time_to_next = next_target - running;
+                if time_to_next < delta {
+                    delta = time_to_next;
+                }
+            }
+        }
 
         let mut events: Vec<midi_file::MidiEvent> =
             self.playback.update(delta).into_iter().cloned().collect();
@@ -107,22 +128,33 @@ impl MidiPlayer {
                         .midi_event(u4::new(channel), event.message);
                 }
                 PlayerConfig::Human => {
-                    self.play_along
+                    let needs_led = self.play_along
                         .midi_event(MidiEventSource::File, &event.message);
 
-                    // For Human PlayAlong, customize velocity for visual distinction on piano LED
-                    let msg = match event.message {
+                    match event.message {
                         midi_file::midly::MidiMessage::NoteOn { key, vel } if vel.as_int() > 0 => {
                             let key_num = key.as_int();
-                            let custom_vel = if is_black_key(key_num) { 120 } else { 80 };
-                            midi_file::midly::MidiMessage::NoteOn {
-                                key,
-                                vel: custom_vel.into(),
+                            log::info!("[WAIT_GATE] File NoteOn key={}, required={:?}", key_num, self.play_along.required_notes());
+                            if needs_led {
+                                let custom_vel = if is_black_key(key_num) { 120 } else { 80 };
+                                self.output.midi_event(
+                                    u4::new(channel),
+                                    midi_file::midly::MidiMessage::NoteOn {
+                                        key,
+                                        vel: custom_vel.into(),
+                                    },
+                                );
                             }
                         }
-                        other => other,
-                    };
-                    self.output.midi_event(u4::new(channel), msg);
+                        midi_file::midly::MidiMessage::NoteOff { .. } => {
+                            // Do NOT send NoteOff to LED or remove from required_notes on Human tracks!
+                            // The LED guide must stay ON until the USER physically strikes the key.
+                            // Extinguishing LED on file NoteOff would prematurely kill LEDs on repeated/overlapping notes.
+                        }
+                        other => {
+                            self.output.midi_event(u4::new(channel), other);
+                        }
+                    }
                 }
                 PlayerConfig::Mute => {}
             }
@@ -149,7 +181,7 @@ impl MidiPlayer {
     /// in (dispatch) any sibling notes inside that window, so the whole
     /// chord becomes required — and lit up — together.
     fn pull_in_chord_siblings(&mut self, events: &mut Vec<midi_file::MidiEvent>) {
-        const CHORD_CLUSTER_WINDOW: Duration = Duration::from_millis(50);
+        const CHORD_CLUSTER_WINDOW: Duration = Duration::from_millis(20);
 
         let anchor_start = events
             .iter()
@@ -165,13 +197,18 @@ impl MidiPlayer {
         };
         let deadline = anchor_start + CHORD_CLUSTER_WINDOW;
 
+        let mut existing_keys: HashSet<u8> = events
+            .iter()
+            .filter_map(|event| match event.message {
+                MidiMessage::NoteOn { key, vel } if vel.as_int() > 0 => Some(key.as_int()),
+                _ => None,
+            })
+            .collect();
+
         loop {
             let leed_in = *self.playback.leed_in();
             let running = self.playback.time();
 
-            // Binary search trên danh sách đã sort/cache sẵn (self.human_note_starts) thay
-            // vì quét lại toàn bộ track mỗi lần — bài nhạc nhiều nốt + hàm này chạy gần như
-            // mỗi frame khi đang PlayAlong sẽ gây giật hình nếu quét O(N) mỗi lần.
             let search_from = running.saturating_sub(leed_in);
             let idx = self.human_note_starts.partition_point(|&start| start <= search_from);
             let next_pending_start = self
@@ -184,10 +221,28 @@ impl MidiPlayer {
                 break;
             };
 
+            // If any note at next_start is a repeated note of an already required key,
+            // DO NOT pull it in (it is a sequential repeated strike, not a simultaneous chord).
+            let has_duplicate_key = self.song.file.tracks.iter()
+                .filter(|track| self.song.config.tracks[track.track_id].player == PlayerConfig::Human)
+                .flat_map(|track| track.notes.iter())
+                .any(|note| note.start == next_start && existing_keys.contains(&note.note));
+
+            if has_duplicate_key {
+                break;
+            }
+
             let extra_delta = (next_start + leed_in).saturating_sub(running);
             let new_events = self.playback.update(extra_delta);
             if new_events.is_empty() {
                 break;
+            }
+            for ev in &new_events {
+                if let MidiMessage::NoteOn { key, vel } = ev.message {
+                    if vel.as_int() > 0 {
+                        existing_keys.insert(key.as_int());
+                    }
+                }
             }
             events.extend(new_events.into_iter().cloned());
         }
@@ -281,7 +336,7 @@ impl MidiPlayer {
                     }
 
                     for note in track.notes.iter() {
-                        if note.start >= next_start && note.start <= next_start + Duration::from_millis(40) {
+                        if note.start >= next_start && note.start <= next_start + Duration::from_millis(30) {
                             active_or_next_notes.push((track.track_id, note.clone()));
                         }
                     }
@@ -401,11 +456,12 @@ impl MidiPlayer {
     pub fn user_midi_event(&mut self, _channel: u8, message: &MidiMessage) {
         match message {
             MidiMessage::NoteOn { key, vel } => {
-                let note_id = key.as_int();
+                let key_num = key.as_int();
                 if vel.as_int() > 0 {
-                    self.play_along.midi_event(MidiEventSource::User, message);
+                    let satisfied = self.play_along.midi_event(MidiEventSource::User, message);
+                    log::info!("[USER_INPUT] NoteOn key={}, vel={}, satisfied={}, remaining_required={:?}", key_num, vel.as_int(), satisfied, self.play_along.required_notes());
                     // When user hits a required note, extinguish its LED guide on the piano
-                    if self.play_along.required_notes().contains(&note_id) {
+                    if satisfied {
                         self.output.midi_event(
                             u4::new(0),
                             midi_file::midly::MidiMessage::NoteOff {
@@ -416,33 +472,10 @@ impl MidiPlayer {
                     }
                 } else {
                     self.play_along.midi_event(MidiEventSource::User, message);
-                    // If user releases a key while chord is not fully complete, re-light it
-                    if self.play_along.required_notes().contains(&note_id) {
-                        let custom_vel = if is_black_key(note_id) { 120 } else { 80 };
-                        self.output.midi_event(
-                            u4::new(0),
-                            midi_file::midly::MidiMessage::NoteOn {
-                                key: *key,
-                                vel: custom_vel.into(),
-                            },
-                        );
-                    }
                 }
             }
-            MidiMessage::NoteOff { key, .. } => {
-                let note_id = key.as_int();
+            MidiMessage::NoteOff { .. } => {
                 self.play_along.midi_event(MidiEventSource::User, message);
-                // If user releases a key while chord is not fully complete, re-light it
-                if self.play_along.required_notes().contains(&note_id) {
-                    let custom_vel = if is_black_key(note_id) { 120 } else { 80 };
-                    self.output.midi_event(
-                        u4::new(0),
-                        midi_file::midly::MidiMessage::NoteOn {
-                            key: *key,
-                            vel: custom_vel.into(),
-                        },
-                    );
-                }
             }
             _ => {}
         }
@@ -467,7 +500,6 @@ struct PlayerStats {
 pub struct PlayAlong {
     user_keyboard_range: piano_layout::KeyboardRange,
     required_notes: HashSet<NoteId>,
-    user_held_keys: HashSet<NoteId>,
     stats: PlayerStats,
 }
 
@@ -476,7 +508,6 @@ impl PlayAlong {
         Self {
             user_keyboard_range,
             required_notes: Default::default(),
-            user_held_keys: Default::default(),
             stats: PlayerStats::default(),
         }
     }
@@ -487,25 +518,29 @@ impl PlayAlong {
         &self.required_notes
     }
 
-    fn user_press_key(&mut self, note_id: u8, active: bool) {
+    fn user_press_key(&mut self, note_id: u8, active: bool) -> bool {
         if active {
-            self.user_held_keys.insert(note_id);
+            // Check if note has arrived from file and is waiting for user
+            self.required_notes.remove(&note_id)
         } else {
-            self.user_held_keys.remove(&note_id);
+            false
         }
     }
 
-    fn file_press_key(&mut self, note_id: u8, active: bool) {
+    fn file_press_key(&mut self, note_id: u8, active: bool) -> bool {
         if active {
             self.required_notes.insert(note_id);
+            true
         } else {
-            self.required_notes.remove(&note_id);
+            // NoteOff from file must NOT remove required notes;
+            // only the user striking the key should satisfy/remove the note.
+            false
         }
     }
 
-    fn press_key(&mut self, src: MidiEventSource, note_id: u8, active: bool) {
+    fn press_key(&mut self, src: MidiEventSource, note_id: u8, active: bool) -> bool {
         if !self.user_keyboard_range.contains(note_id) {
-            return;
+            return false;
         }
 
         match src {
@@ -514,29 +549,24 @@ impl PlayAlong {
         }
     }
 
-    pub fn midi_event(&mut self, source: MidiEventSource, message: &MidiMessage) {
+    pub fn midi_event(&mut self, source: MidiEventSource, message: &MidiMessage) -> bool {
         match message {
             MidiMessage::NoteOn { key, vel } => {
                 let active = vel.as_int() > 0;
-                self.press_key(source, key.as_int(), active);
+                self.press_key(source, key.as_int(), active)
             }
             MidiMessage::NoteOff { key, .. } => {
-                self.press_key(source, key.as_int(), false);
+                self.press_key(source, key.as_int(), false)
             }
-            _ => {}
+            _ => false,
         }
     }
 
     pub fn clear(&mut self) {
         self.required_notes.clear();
-        self.user_held_keys.clear();
     }
 
     pub fn are_required_keys_pressed(&self) -> bool {
-        if self.required_notes.is_empty() {
-            return true;
-        }
-        // All currently required notes (e.g. chord) must be held simultaneously
-        self.required_notes.iter().all(|note| self.user_held_keys.contains(note))
+        self.required_notes.is_empty()
     }
 }

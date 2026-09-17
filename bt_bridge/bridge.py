@@ -77,39 +77,7 @@ class NeothesiaBTBridge:
                     def ble_notify_callback(sender, data: bytearray):
                         if not self.tcp_writer or self.tcp_writer.is_closing():
                             return
-
-                        filtered_bytes = bytearray()
-                        i = 0
-                        while i < len(data):
-                            status = data[i]
-                            msg_type = status & 0xF0
-
-                            if msg_type in (0x80, 0x90, 0xA0, 0xB0, 0xE0):
-                                if i + 2 < len(data):
-                                    key = data[i+1]
-                                    vel = data[i+2]
-                                    is_on = (msg_type == 0x90 and vel > 0)
-                                    key_type = 0x90 if is_on else 0x80
-
-                                    if msg_type in (0x80, 0x90) and self.is_echo_and_consume(key_type, key):
-                                        logger.debug(f"[ECHO FILTERED] Dropped echo for Note {key} (on={is_on})")
-                                    else:
-                                        filtered_bytes.extend(data[i:i+3])
-                                    i += 3
-                                else:
-                                    break
-                            elif msg_type in (0xC0, 0xD0):
-                                if i + 1 < len(data):
-                                    filtered_bytes.extend(data[i:i+2])
-                                    i += 2
-                                else:
-                                    break
-                            else:
-                                filtered_bytes.append(status)
-                                i += 1
-
-                        if filtered_bytes:
-                            self.tcp_writer.write(filtered_bytes)
+                        self.tcp_writer.write(data)
 
                     await client.start_notify(JDY_CHAR_UUID, ble_notify_callback)
                     logger.info("[OK] BLE Notification active. Forwarding Piano -> Neothesia.")
@@ -122,32 +90,13 @@ class NeothesiaBTBridge:
                                 self.running = False
                                 break
                             try:
-                                # Parse outgoing MIDI stream to register expected echoes
-                                i = 0
-                                while i < len(data):
-                                    status = data[i]
-                                    msg_type = status & 0xF0
-                                    if msg_type in (0x80, 0x90, 0xA0, 0xB0, 0xE0):
-                                        if i + 2 < len(data):
-                                            if msg_type in (0x80, 0x90):
-                                                key = data[i+1]
-                                                vel = data[i+2]
-                                                is_on = (msg_type == 0x90 and vel > 0)
-                                                key_type = 0x90 if is_on else 0x80
-                                                self.register_expected_echo(key_type, key)
-                                            elif msg_type == 0xB0:
-                                                cc_num = data[i+1]
-                                                if cc_num == 123:  # All Notes Off
-                                                    self.echo_timestamps.clear()
-                                            i += 3
-                                        else:
-                                            break
-                                    elif msg_type in (0xC0, 0xD0):
-                                        i += 2
-                                    else:
-                                        i += 1
-
-                                await client.write_gatt_char(JDY_CHAR_UUID, data, response=True)
+                                # Write in chunks of max 20 bytes (standard BLE GATT MTU payload for JDY-33)
+                                for chunk_start in range(0, len(data), 20):
+                                    chunk = data[chunk_start:chunk_start+20]
+                                    try:
+                                        await client.write_gatt_char(JDY_CHAR_UUID, chunk, response=True)
+                                    except Exception:
+                                        await client.write_gatt_char(JDY_CHAR_UUID, chunk, response=False)
                             except Exception as write_err:
                                 logger.error(f"BLE write error: {write_err}")
 
